@@ -1,0 +1,9 @@
+{
+  "profiles": {
+    "U2AzureFunctions": {
+      "commandName": "Project",
+      "commandLineArgs": "--port 7044",
+      "launchBrowser": false
+    }
+  }
+}
