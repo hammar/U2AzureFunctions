@@ -16,7 +16,13 @@ namespace U2
     {
         private static List<string> _numericDeviceClasses = new(){"illuminance","temperature"};
         private static List<string> _onOffReportingDeviceClasses = new(){"motion"};
+        private static Dictionary<string,string> _deviceClassModelIdMapping = new(){
+            {"illuminance","dtmi:org:brickschema:schema:Brick:Illuminance_Sensor;1"},
+            {"temperature","dtmi:org:brickschema:schema:Brick:Temperature_Sensor;1"},
+            {"motion","dtmi:org:brickschema:schema:Brick:Motion_Sensor;1"}
+        };
 
+        // TODO: Put connection string in key vault
         [FunctionName("IngestHomeAssistantState")]
         public static async Task Run([EventHubTrigger("u2-eventhub-homeassistant", Connection = "u2eventhub_U2AzureFunctionsPolicy_EVENTHUB")] EventData[] events, ILogger log)
         {
@@ -64,32 +70,72 @@ namespace U2
 
                             string deviceClass = deviceClassElement.GetString();
 
+                            // Set up patch document and map input state string into model-appropriate value representation
                             JsonPatchDocument twinUpdate = new JsonPatchDocument();
-                            bool valueMapped = false;
+
+                            // We don't know what value type we'll be dealing with at this point, so value is generic object
+                            object value = null;
                             if (_numericDeviceClasses.Contains(deviceClass)) {
-                                if (double.TryParse(state, out double value)) {
-                                   twinUpdate.AppendAdd("/lastKnownValue/value", value);
-                                   twinUpdate.AppendAdd("/lastKnownValue/timestamp", lastChanged);
-                                   valueMapped = true;
+                                if (double.TryParse(state, out double parsedValue)) {
+                                    value = parsedValue;
+                                    twinUpdate.AppendReplace("/lastKnownValue/value", value);
+                                    twinUpdate.AppendReplace("/lastKnownValue/timestamp", lastChanged);
                                 }
                             }
                             else if (_onOffReportingDeviceClasses.Contains(deviceClass)) {
-                                bool value = state.ToLower() == "on";
-                                twinUpdate.AppendAdd("/lastKnownValue/value", value);
-                                twinUpdate.AppendAdd("/lastKnownValue/timestamp", lastChanged);
-                                valueMapped = true;
+                                value = state.ToLower() == "on";
+                                twinUpdate.AppendReplace("/lastKnownValue/value", value);
+                                twinUpdate.AppendReplace("/lastKnownValue/timestamp", lastChanged);
                             }
                             
-                            if (valueMapped) {
+                            // If we were able to map the input value to a suitable representation, value is no longer null
+                            // TODO: put ADT instance URL in application setting
+                            if (value != null) {
                                 // Connect to ADT
                                 string adtInstanceUrl = "https://u2-adt.api.neu.digitaltwins.azure.net"; 
                                 var credential = new DefaultAzureCredential();
                                 var client = new DigitalTwinsClient(new Uri(adtInstanceUrl), credential);
                                 log.LogInformation($"Service client created - ready to go");
 
-                                log.LogInformation($"Updating twin '{twinId}' with operation '{twinUpdate.ToString()}'");
-                                await Task.Yield();
-                                //await client.UpdateDigitalTwinAsync(twinId, twinUpdate);
+                                // Try and update existing twin with new values
+                                try {
+                                    log.LogInformation($"Updating twin '{twinId}' with operation '{twinUpdate.ToString()}'");
+                                    await client.UpdateDigitalTwinAsync(twinId, twinUpdate);
+                                }
+                                
+                                catch (RequestFailedException ex) {
+                                    // If the twin does not exist yet, try and create it
+                                    if (ex.Status == 404 && ex.ErrorCode == "DigitalTwinNotFound")
+                                    {
+                                        string modelId = _deviceClassModelIdMapping[deviceClass];
+                                        BasicDigitalTwin newTwin = new BasicDigitalTwin {
+                                            Id = twinId,
+                                            Metadata = { ModelId = modelId },
+                                            Contents = {
+                                                {
+                                                    "lastKnownValue", new Dictionary<string, object>() {
+                                                        { "timestamp", lastChanged },
+                                                        { "value", value }
+                                                    }
+                                                }
+                                            }
+                                        };
+                                        log.LogInformation($"DigitalTwinNotFound -- creating new twin: {newTwin}");
+                                        await client.CreateOrReplaceDigitalTwinAsync(twinId, newTwin);
+                                    }
+
+                                    // If twin.lastKnownValue object is not yet instantiated (can happen if twin added manually, 
+                                    // e.g., through ADT Explorer), instantiate it
+                                    if (ex.Status == 400 && ex.ErrorCode == "JsonPatchInvalid") {
+                                        JsonPatchDocument createLastKnownValue = new JsonPatchDocument();
+                                        createLastKnownValue.AppendAdd("/lastKnownValue", new Dictionary<string, object>() {
+                                            {"timestamp", lastChanged },
+                                            {"value", value }
+                                        });
+                                        log.LogInformation($"JsonPatchInvalid -- instantiating lastKnownValue: {createLastKnownValue}");
+                                        await client.UpdateDigitalTwinAsync(twinId, createLastKnownValue);
+                                    }
+                                }
                             }  
                         }
                     }
